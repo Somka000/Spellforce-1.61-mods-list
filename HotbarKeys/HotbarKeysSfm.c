@@ -20,8 +20,9 @@ __declspec(dllexport) void InitModule(SpellforceSpellFramework* framework)
 
 __declspec(dllexport) void* RegisterMod(SpellforceSpellFramework* framework)
 {
-    return framework->createModInfo("Hotbar Keys", "1.0.0", "Somka",
-                                    "F2-F6 use the first five slots of the spell hotbar (configurable in HotbarKeys.txt).");
+    return framework->createModInfo("Hotbar Keys", "1.1.0", "Somka",
+                                    "F2-F6 use the first five slots of the spell hotbar, Shift+F2-F6 the spells shown "
+                                    "under the avatar portrait for the selected enemy (configurable in HotbarKeys.txt).");
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)

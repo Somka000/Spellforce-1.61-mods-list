@@ -1,7 +1,8 @@
 #pragma once
-// HotbarKeys - keyboard keys for the 10 slots of the spell hotbar on the bottom bar in SpellForce 1.61.11213.
-// By default F2..F6 use slots 1..5; slots 6..10 have no key. Keys are read from HotbarKeys.txt next to the
-// .asi/.sfm file; the file is created with default values when missing.
+// HotbarKeys - keyboard keys for the 10 slots of the spell hotbar on the bottom bar and for the target spells
+// under a quick-select portrait in SpellForce 1.61.11213.
+// By default F2..F6 use slots 1..5 and Shift+F2..F6 the top five target spells of the avatar. Keys are read from
+// HotbarKeys.txt next to the .asi/.sfm file; the file is created with default values when missing.
 //
 // How the game handles a click on a hotbar slot (addresses with the default image base):
 //   CUiMain (vtable 00C06ADC, constructor 009DD1C0, destructor 009DE3C0) keeps the hotbar at [this+774Ch].
@@ -13,10 +14,18 @@
 //   accepts the click when the button has the "pressed by the mouse" flag (100000h at +128h), which the mouse
 //   down sets; the patch sets that flag for the call.
 //
+//
+// Target spells: with an enemy selected, a column of spell buttons the hero can use on it appears under each
+// portrait of the quick-select bar in the top left corner (column 0 = avatar, 1..5 = heroes). CUiMain keeps them
+// as a grid of 12 rows x 6 columns at [CUiMain+77A8h + 18h*row + 4*column] (buttons with vtable 00BE7994, created
+// in 009E1840, filled top-down by 009E3550). A left click calls CUiMain::OnQsAction (vtable +33Ch, 009EBA10) with
+// (button, mouse event); it checks the same mouse button and "pressed by the mouse" flag as the hotbar.
+//
 // The patch hooks the CUiMain constructor and destructor to know the live CUiMain. A background thread watches
 // the keys while the game window is in front and posts a message to the game window; the window procedure
-// (subclassed by the patch) then calls CUiBottom::OnActionButton for that slot on the game's own thread, with
-// a left-click event. The mouse is not touched. Nothing happens while the hotbar or the slot is hidden.
+// (subclassed by the patch) then calls CUiBottom::OnActionButton for that slot (or CUiMain::OnQsAction for that
+// target spell) on the game's own thread, with a left-click event. The mouse is not touched. Nothing happens
+// while the button is hidden.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -42,10 +51,14 @@ static BOOL IsGameImageLargeEnough(BYTE* base)
 #define MAIN_VTABLE_RVA    0x806ADC
 #define BOTTOM_VTABLE_RVA  0x805A68
 #define BUTTON_VTABLE_RVA  0x7E7CCC
+#define QS_BUTTON_VTABLE_RVA 0x7E7994
 
 #define MAIN_HOTBAR        0x774C
 #define BOTTOM_BUTTONS     0x39C
 #define BOTTOM_ON_ACTION   0x334 // vtable offset of CUiBottom::OnActionButton(button, event)
+#define MAIN_QS_BUTTONS    0x77A8 // + QS_ROW_SIZE * row + 4 * column
+#define QS_ROW_SIZE        0x18
+#define MAIN_ON_QS_ACTION  0x33C // vtable offset of CUiMain::OnQsAction(button, event)
 #define CONTROL_FLAGS      0x128
 #define CONTROL_PARENT     0x12C
 #define FLAG_VISIBLE       2
@@ -53,6 +66,9 @@ static BOOL IsGameImageLargeEnough(BYTE* base)
 #define EVENT_MOUSE_BUTTON 0x20
 
 #define SLOT_COUNT         10
+#define TARGET_COUNT       12 // rows of target spells under a portrait
+#define QS_COLUMN_COUNT    6
+#define KEY_COUNT          (SLOT_COUNT + TARGET_COUNT) // keys 0..9 = hotbar slots, 10..21 = target spells
 #define MAX_PARENT_DEPTH   32
 
 static const BYTE CtorOriginal[] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF };       // push ebp; mov ebp,esp; push -1
@@ -61,7 +77,8 @@ static const BYTE DtorOriginal[] = { 0x55, 0x8B, 0xEC, 0x56, 0x8B, 0xF1 }; // pu
 static const char DefaultConfig[] =
     "# HotbarKeys (.asi or .sfm) - keys that use the 10 slots of the spell hotbar on the bottom bar.\r\n"
     "# Slot1 is the leftmost slot. Leave a slot empty for no key.\r\n"
-    "# Key names: F1-F24, A-Z, 0-9, NUM0-NUM9, or a decimal Windows virtual-key code.\r\n"
+    "# Key names: F1-F24, A-Z, 0-9, NUM0-NUM9, or a decimal Windows virtual-key code, optionally with Shift+\r\n"
+    "# in front (Shift+Z). A key without Shift+ also works with Shift held, unless Shift+ that key is used too.\r\n"
     "Slot1=F2\r\n"
     "Slot2=F3\r\n"
     "Slot3=F4\r\n"
@@ -72,12 +89,30 @@ static const char DefaultConfig[] =
     "Slot8=\r\n"
     "Slot9=\r\n"
     "Slot10=\r\n"
+    "# Target spells: the column of spells shown under a portrait in the top left corner while an enemy is\r\n"
+    "# selected. Target1 is the topmost spell. TargetPortrait picks the portrait: 1 = avatar, 2-6 = heroes.\r\n"
+    "TargetPortrait=1\r\n"
+    "Target1=Shift+F2\r\n"
+    "Target2=Shift+F3\r\n"
+    "Target3=Shift+F4\r\n"
+    "Target4=Shift+F5\r\n"
+    "Target5=Shift+F6\r\n"
+    "Target6=\r\n"
+    "Target7=\r\n"
+    "Target8=\r\n"
+    "Target9=\r\n"
+    "Target10=\r\n"
+    "Target11=\r\n"
+    "Target12=\r\n"
     "# Log=1 writes HotbarKeys.log next to this file (useful when a key does nothing).\r\n"
     "Log=0\r\n";
 
+#define KEY_SHIFT 0x100 // added to a virtual-key code for keys written with Shift+
+
 static BYTE* GameBase;
 static HINSTANCE ModuleInstance;
-static int SlotKeys[SLOT_COUNT];
+static int Keys[KEY_COUNT];
+static int TargetColumn;
 static BOOL LogEnabled;
 static char LogPath[MAX_PATH];
 
@@ -136,6 +171,11 @@ static int ParseKey(const char* name)
 {
     while (*name == ' ' || *name == '\t') name++;
     if (*name == '\0') return 0;
+    if (_strnicmp(name, "Shift+", 6) == 0)
+    {
+        int vk = ParseKey(name + 6);
+        return vk != 0 && vk != VK_SHIFT ? vk | KEY_SHIFT : 0;
+    }
     if ((name[0] == 'F' || name[0] == 'f') && name[1] >= '1' && name[1] <= '9')
     {
         int n = atoi(name + 1);
@@ -173,7 +213,13 @@ static void ReadConfig(void)
     FILE* file;
     int i;
 
-    for (i = 0; i < SLOT_COUNT; i++) SlotKeys[i] = i < 5 ? VK_F2 + i : 0;
+    for (i = 0; i < KEY_COUNT; i++) Keys[i] = 0;
+    for (i = 0; i < 5; i++)
+    {
+        Keys[i] = VK_F2 + i;
+        Keys[SLOT_COUNT + i] = (VK_F2 + i) | KEY_SHIFT;
+    }
+    TargetColumn = 0;
 
     if (GetModuleFileNameA(ModuleInstance, path, MAX_PATH) == 0) return;
     slash = strrchr(path, '\\');
@@ -200,11 +246,52 @@ static void ReadConfig(void)
         if (_strnicmp(line, "Slot", 4) == 0)
         {
             int slot = atoi(line + 4);
-            if (slot >= 1 && slot <= SLOT_COUNT) SlotKeys[slot - 1] = ParseKey(value);
+            if (slot >= 1 && slot <= SLOT_COUNT) Keys[slot - 1] = ParseKey(value);
+        }
+        else if (_stricmp(line, "TargetPortrait") == 0)
+        {
+            int portrait = atoi(value);
+            if (portrait >= 1 && portrait <= QS_COLUMN_COUNT) TargetColumn = portrait - 1;
+        }
+        else if (_strnicmp(line, "Target", 6) == 0)
+        {
+            int row = atoi(line + 6);
+            if (row >= 1 && row <= TARGET_COUNT) Keys[SLOT_COUNT + row - 1] = ParseKey(value);
         }
         else if (_stricmp(line, "Log") == 0) LogEnabled = atoi(value) != 0;
     }
     fclose(file);
+}
+
+// True when <control> and all its parents are shown. Call inside __try.
+static BOOL IsControlShown(BYTE* control, const char* what, int number)
+{
+    BYTE* node = control;
+    int depth;
+    for (depth = 0; depth < MAX_PARENT_DEPTH; depth++)
+    {
+        BYTE* parent = *(BYTE**)(node + CONTROL_PARENT);
+        if (parent == NULL) return TRUE;
+        if ((*(DWORD*)(node + CONTROL_FLAGS) & FLAG_VISIBLE) == 0)
+        {
+            Log("%s %d: hidden (level %d, flags %08X)", what, number, depth, *(DWORD*)(node + CONTROL_FLAGS));
+            return FALSE;
+        }
+        node = parent;
+    }
+    return FALSE;
+}
+
+// Returns the live CUiMain, or NULL when there is no game UI. Call inside __try.
+static BYTE* GetMain(const char* what, int number)
+{
+    BYTE* main = LiveMain;
+    if (main == NULL || *(DWORD*)main != (DWORD)(GameBase + MAIN_VTABLE_RVA))
+    {
+        Log("%s %d: no game UI", what, number);
+        return NULL;
+    }
+    return main;
 }
 
 // Finds the hotbar and the button of <slot>. Fails when there is no game UI, the hotbar or the button (or one
@@ -214,15 +301,8 @@ static BOOL FindSlotButton(int slot, BYTE** bar, BYTE** button)
     BOOL ok = FALSE;
     __try
     {
-        BYTE* main = LiveMain;
-        BYTE* node;
-        int depth;
-
-        if (main == NULL || *(DWORD*)main != (DWORD)(GameBase + MAIN_VTABLE_RVA))
-        {
-            Log("slot %d: no game UI", slot + 1);
-            return FALSE;
-        }
+        BYTE* main = GetMain("slot", slot + 1);
+        if (main == NULL) return FALSE;
         *bar = *(BYTE**)(main + MAIN_HOTBAR);
         if (*bar == NULL || *(DWORD*)*bar != (DWORD)(GameBase + BOTTOM_VTABLE_RVA))
         {
@@ -235,22 +315,7 @@ static BOOL FindSlotButton(int slot, BYTE** bar, BYTE** button)
             Log("slot %d: no button", slot + 1);
             return FALSE;
         }
-        node = *button;
-        for (depth = 0; depth < MAX_PARENT_DEPTH; depth++)
-        {
-            BYTE* parent = *(BYTE**)(node + CONTROL_PARENT);
-            if (parent == NULL)
-            {
-                ok = TRUE;
-                break;
-            }
-            if ((*(DWORD*)(node + CONTROL_FLAGS) & FLAG_VISIBLE) == 0)
-            {
-                Log("slot %d: hidden (level %d, flags %08X)", slot + 1, depth, *(DWORD*)(node + CONTROL_FLAGS));
-                break;
-            }
-            node = parent;
-        }
+        ok = IsControlShown(*button, "slot", slot + 1);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -260,38 +325,73 @@ static BOOL FindSlotButton(int slot, BYTE** bar, BYTE** button)
     return ok;
 }
 
-typedef void (__fastcall *OnActionButtonFn)(BYTE* bar, void* unused, BYTE* button, BYTE* event);
+// Finds the target spell button in <row> under the configured portrait. Fails like FindSlotButton; the button
+// is hidden when no enemy is selected or the hero has fewer target spells.
+static BOOL FindTargetButton(int row, BYTE** main, BYTE** button)
+{
+    BOOL ok = FALSE;
+    __try
+    {
+        *main = GetMain("target", row + 1);
+        if (*main == NULL) return FALSE;
+        *button = *(BYTE**)(*main + MAIN_QS_BUTTONS + QS_ROW_SIZE * row + 4 * TargetColumn);
+        if (*button == NULL || *(DWORD*)*button != (DWORD)(GameBase + QS_BUTTON_VTABLE_RVA))
+        {
+            Log("target %d: no button", row + 1);
+            return FALSE;
+        }
+        ok = IsControlShown(*button, "target", row + 1);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Log("target %d: game UI memory not readable", row + 1);
+        ok = FALSE;
+    }
+    return ok;
+}
 
-// Runs on the game thread (from the window procedure): does what a left click on the slot does.
-static void UseSlot(int slot)
+typedef void (__fastcall *ButtonHandlerFn)(BYTE* owner, void* unused, BYTE* button, BYTE* event);
+
+// Calls the click handler at <handlerOffset> in the vtable of <owner> the way a left click on <button> does.
+static void ClickButton(BYTE* owner, DWORD handlerOffset, BYTE* button)
 {
     // The handlers read only the mouse button (+20h) of the event; the rest stays zero.
     static BYTE leftClick[0x100];
-    BYTE* bar;
-    BYTE* button;
-    OnActionButtonFn onAction;
-
-    DWORD* flags;
+    ButtonHandlerFn handler = *(ButtonHandlerFn*)(*(BYTE**)owner + handlerOffset);
+    DWORD* flags = (DWORD*)(button + CONTROL_FLAGS);
     DWORD pressedBefore;
 
-    if (!FindSlotButton(slot, &bar, &button)) return;
     *(DWORD*)(leftClick + EVENT_MOUSE_BUTTON) = 0;
-    onAction = *(OnActionButtonFn*)(*(BYTE**)bar + BOTTOM_ON_ACTION);
-    flags = (DWORD*)(button + CONTROL_FLAGS);
-    Log("slot %d: bar %p button %p flags %08X", slot + 1, bar, button, *flags);
-    // CUiMain::OnSpellSlot ignores the click unless the button is marked as pressed by the mouse (set on mouse
-    // down, checked on mouse up), so mark it for the call and put the bit back afterwards.
+    Log("owner %p button %p flags %08X", owner, button, *flags);
+    // The handlers ignore the click unless the button is marked as pressed by the mouse (set on mouse down,
+    // checked on mouse up), so mark it for the call and put the bit back afterwards.
     pressedBefore = *flags & FLAG_MOUSE_PRESSED;
     *flags |= FLAG_MOUSE_PRESSED;
-    onAction(bar, NULL, button, leftClick);
+    handler(owner, NULL, button, leftClick);
     *flags = (*flags & ~FLAG_MOUSE_PRESSED) | pressedBefore;
+}
+
+// Runs on the game thread (from the window procedure): does what a left click on the slot or target spell does.
+static void UseKey(int key)
+{
+    BYTE* owner;
+    BYTE* button;
+
+    if (key < SLOT_COUNT)
+    {
+        if (FindSlotButton(key, &owner, &button)) ClickButton(owner, BOTTOM_ON_ACTION, button);
+    }
+    else if (FindTargetButton(key - SLOT_COUNT, &owner, &button))
+    {
+        ClickButton(owner, MAIN_ON_QS_ACTION, button);
+    }
 }
 
 static LRESULT CALLBACK HotbarWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     if (message == UseSlotMessage && UseSlotMessage != 0)
     {
-        if (wParam < SLOT_COUNT) UseSlot((int)wParam);
+        if (wParam < KEY_COUNT) UseKey((int)wParam);
         return 0;
     }
     return CallWindowProcA(GameWindowProc, window, message, wParam, lParam);
@@ -312,21 +412,32 @@ static void HookGameWindow(HWND window)
 
 static DWORD WINAPI KeyThread(LPVOID unused)
 {
-    BOOL wasDown[SLOT_COUNT] = { 0 };
+    BOOL wasDown[KEY_COUNT] = { 0 };
+    BOOL shiftUsed[256] = { 0 }; // virtual keys that some key uses with Shift+
+    int i;
+
+    for (i = 0; i < KEY_COUNT; i++)
+    {
+        if (Keys[i] & KEY_SHIFT) shiftUsed[Keys[i] & 0xFF] = TRUE;
+    }
     for (;;)
     {
         HWND window = GetForegroundWindow();
         DWORD processId = 0;
         BOOL gameInFront;
-        int i;
+        BOOL shift;
 
         Sleep(10);
         if (window != NULL) GetWindowThreadProcessId(window, &processId);
         gameInFront = processId == GetCurrentProcessId();
         if (gameInFront) HookGameWindow(window);
-        for (i = 0; i < SLOT_COUNT; i++)
+        shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        for (i = 0; i < KEY_COUNT; i++)
         {
-            BOOL down = SlotKeys[i] != 0 && gameInFront && (GetAsyncKeyState(SlotKeys[i]) & 0x8000) != 0;
+            int vk = Keys[i] & 0xFF;
+            // Shift+X needs Shift; plain X works with or without Shift unless Shift+X belongs to another key.
+            BOOL down = Keys[i] != 0 && gameInFront && (GetAsyncKeyState(vk) & 0x8000) != 0 &&
+                        ((Keys[i] & KEY_SHIFT) ? shift : !(shift && shiftUsed[vk]));
             // Alt and Ctrl combinations (Alt+F4 and the like) are left to the game.
             if (down && !wasDown[i] && (GetAsyncKeyState(VK_MENU) & 0x8000) == 0 &&
                 (GetAsyncKeyState(VK_CONTROL) & 0x8000) == 0 && GameWindow != NULL)
@@ -379,6 +490,8 @@ static void ApplyPatch(HINSTANCE instance)
     thread = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL);
     if (thread != NULL) CloseHandle(thread);
 
-    for (i = 0; i < SLOT_COUNT; i++) Log("Slot%d key %d", i + 1, SlotKeys[i]);
-    OutputDebugStringA("HotbarKeys: hotbar slot keys active.\n");
+    for (i = 0; i < SLOT_COUNT; i++) Log("Slot%d key %03X", i + 1, Keys[i]);
+    for (i = 0; i < TARGET_COUNT; i++) Log("Target%d key %03X", i + 1, Keys[SLOT_COUNT + i]);
+    Log("TargetPortrait %d", TargetColumn + 1);
+    OutputDebugStringA("HotbarKeys: hotbar slot and target spell keys active.\n");
 }
