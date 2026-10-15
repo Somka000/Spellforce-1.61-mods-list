@@ -1,0 +1,1 @@
+### Game contains many unused sounds (in pak10), this mod restores the sounds made by the avatar, heroes, units, titans, and workers when they are detected by an enemy scout.
