@@ -2,4 +2,5 @@ Here are mods for SpellForce 1.61 (public test) in .asi and/or .sfm format, sour
 To download a mod:
 - for the vanilla version, download the .asi file
 - for the version with SFSF, download the .sfm file
+
 If you want to submit any mod, please create a PR, source code is welcome.
