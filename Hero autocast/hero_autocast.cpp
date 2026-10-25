@@ -8,6 +8,21 @@
  * restores all mana, is only cast while the mana is below a share of the
  * maximum set in the ini file (33% by default).
  *
+ * Outside fights: some toggled spells (outside_combat in the ini file; by
+ * default Healing, Greater Healing, Charisma, Enlightenment and Meditation)
+ * are also cast while the avatar or hero stands idle: Meditation below the
+ * mana share, the healing spells on the most wounded of the avatar and heroes
+ * in range below heal_health_percent of their health, any other spell on the
+ * caster once it has run out. The cast is ordered like a player's (it
+ * checks only the mana for heroes: cooldowns are checked here).
+ *
+ * Summons: a toggled summon spell has a number of summons to keep (shown at
+ * the icon's top right corner): "+" with a right click raises it, "-" with a
+ * right click lowers it (0 turns autocast off). In and out of fights the
+ * caster summons again while it has fewer of them; in a fight a due summon
+ * goes before what the battle AI chose. Each summon is a spell running with
+ * the caster as its source, which is how they are counted.
+ *
  * Two things keep the vanilla battle AI from casting for the avatar and heroes:
  *  - their spells are not in the figure's action list (which the AI ranks);
  *    they live in the player's spell slots, mirrored client side in UiDbProxy
@@ -30,7 +45,9 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <set>
+#include <map>
 
 SpellforceSpellFramework *sfsf;
 SFLog *logAPI;
@@ -54,6 +71,19 @@ SFLog *logAPI;
 #define RVA_AI_LEAVE_BATTLE        0x3607a7
 #define AI_LEAVE_BATTLE_PROLOGUE   10
 #define RVA_CGDSPELL_END_SPELL     0x34b0a0
+// CGdFigureJobs::Trigger: calls to the idle jobs (JobDoNothing, JobWarriorNothing),
+// (thiscall jobs, figure); they run again each time the idle animation ends
+#define RVA_JOB_NOTHING_CALL       0x2f16dd
+#define RVA_JOB_NOTHING            0x2ec620
+#define RVA_JOB_WARRIOR_NOTHING_CALL 0x2f17e1
+#define RVA_JOB_WARRIOR_NOTHING    0x2eeeb0
+// CGdFigureToolBox::FigureCanCastSpell (figure, action): cooldowns of the action and mana
+#define RVA_FIGURE_CAN_CAST_SPELL  0x2f82d0
+// CGdFigureToolBox::doCastSpell (figure, spell, target index, target type, target
+// position, check sight, any target): what a player's cast order runs
+#define RVA_DO_CAST_SPELL          0x2fb310
+#define RVA_GET_CURRENT_TICK       0x277290    // AutoClass14::getCurrentTick
+#define TARGET_FIGURE              1
 
 // Vtable slots
 #define RVA_CUIBOTTOM_VT_CLICK     0x805d9c    // CUiBottom slot 205: action button clicked
@@ -119,6 +149,14 @@ SFLog *logAPI;
 // Meditation restores all mana; autocast only uses it below a share of the maximum
 #define MEDITATION_DEFAULT_PERCENT 33
 #define MEDITATION_KEY             "meditation_mana_percent"
+#define OUTSIDE_COMBAT_KEY         "outside_combat"
+#define HEAL_KEY                   "heal_health_percent"
+#define HEAL_DEFAULT_PERCENT       70
+// A cast ordered outside a fight is not ordered again for this long (the
+// spell slots' cooldowns, mirrored for the interface, may lag behind)
+#define ORDER_GUARD_TICKS          30
+#define TICKS_PER_SECOND           10
+#define SUMMON_COUNT_MAX           20
 #define ACTION_EMPTY               0xffff
 
 // Owner part of an autocast key
@@ -143,6 +181,11 @@ typedef void (__thiscall *end_spell_ptr)(SF_CGdSpell *spell, uint16_t spell_inde
 typedef char (__thiscall *spell_of_item_ptr)(void *uidb, uint16_t item, uint16_t *spell_id);
 typedef uint16_t (__thiscall *spell_line_ptr)(void *resource, uint16_t spell_id);
 typedef int (__thiscall *spell_line_flag_ptr)(void *resource, uint16_t spell_line);
+typedef void (__thiscall *job_ptr)(SF_CGdFigureJobs *jobs, uint32_t figure);
+typedef int (__thiscall *can_cast_ptr)(SF_CGdFigureToolbox *toolbox, uint32_t figure, SF_SGtFigureAction *action);
+typedef int (__thiscall *do_cast_ptr)(SF_CGdFigureToolbox *toolbox, uint32_t figure, uint32_t spell, uint32_t target,
+                                      uint32_t target_type, SF_Coord position, int check_sight, int any_target);
+typedef uint32_t (__thiscall *tick_ptr)(AutoClass14 *ticks);
 
 static uintptr_t s_base;
 static bottom_click_ptr s_orig_bottom_click;
@@ -156,6 +199,11 @@ static end_spell_ptr s_end_spell;
 static spell_of_item_ptr s_spell_of_item;
 static spell_line_ptr s_spell_line;
 static spell_line_flag_ptr s_spell_line_is_target_self;
+static job_ptr s_job_nothing;
+static job_ptr s_job_warrior_nothing;
+static can_cast_ptr s_figure_can_cast;
+static do_cast_ptr s_do_cast;
+static tick_ptr s_current_tick;
 
 // The game's CUiMain, captured when the bottom bar renders. Its UiDbProxy holds
 // the local player's hero spell slots and cooldowns.
@@ -165,6 +213,15 @@ static void *s_cuimain;
 static std::set<uint32_t> s_autocast;
 static D3DCOLOR s_outline_color = D3DCOLOR_ARGB(0xff, 0, 0, 0) | OUTLINE_DEFAULT_COLOR;
 static unsigned s_meditation_percent = MEDITATION_DEFAULT_PERCENT;
+static unsigned s_heal_percent = HEAL_DEFAULT_PERCENT;
+// Spell lines also cast outside fights
+static std::set<uint16_t> s_outside_combat = {kGdSpellLineHealing, kGdSpellLineGreaterHealing, kGdSpellLineCharisma,
+                                              kGdSpellLineEnlightenment, kGdSpellLineMeditation};
+// (figure << 16) | spell line -> tick before which a cast ordered by the mod is
+// not ordered again
+static std::map<uint32_t, uint32_t> s_ordered;
+// Autocast key -> number of summons to keep (toggled summon spells only)
+static std::map<uint32_t, int> s_summon_counts;
 // Keys already reported to the log by the battle AI hook
 static std::set<uint32_t> s_reported;
 // Spell lines injected into the last ranked hero's action list
@@ -227,6 +284,26 @@ static bool get_hero_slots(void *cuimain, uint16_t figure_index, HeroSlots *hero
     return false;
 }
 
+// The local player's avatar and heroes (figure indices, 0 = none)
+static int get_party(void *cuimain, uint16_t *figures)
+{
+    uint8_t *controller = field<uint8_t *>(cuimain, CUIMAIN_CONTROLLER);
+    uint8_t *players = field<uint8_t *>(cuimain, CUIMAIN_CGDPLAYER);
+    if (!controller || !players)
+    {
+        return 0;
+    }
+    uint16_t player = field<uint16_t>(controller, CONTROLLER_LOCAL_PLAYER);
+    uint8_t *record = players + CGDPLAYER_PLAYERS + player * PLAYER_SIZE;
+    int count = 0;
+    figures[count++] = field<uint16_t>(record, PLAYER_MAINCHAR_FIGURE);
+    for (int i = 0; i < PLAYER_HERO_COUNT; i++)
+    {
+        figures[count++] = field<uint16_t>(record, PLAYER_HERO_FIGURES + i * 2);
+    }
+    return count;
+}
+
 // Spell in a hero spell slot; false when the slot is empty.
 static bool get_slot_spell(void *cuimain, const HeroSlots &hero, int index,
                            uint16_t *spell_line, uint16_t *spell_id, uint32_t *ready_tick)
@@ -270,6 +347,8 @@ static void load_autocast()
     unsigned percent;
     bool has_color = false;
     bool has_meditation = false;
+    bool has_outside = false;
+    bool has_heal = false;
     while (fgets(line, sizeof(line), f))
     {
         if (sscanf(line, " " OUTLINE_COLOR_KEY " = #%x", &color) == 1 ||
@@ -285,7 +364,28 @@ static void load_autocast()
             has_meditation = true;
             continue;
         }
-        if (sscanf(line, "%u %u", &owner, &spell_line) != 2)
+        if (sscanf(line, " " HEAL_KEY " = %u", &percent) == 1)
+        {
+            s_heal_percent = percent > 100 ? 100 : percent;
+            has_heal = true;
+            continue;
+        }
+        int offset = 0;
+        if (sscanf(line, " " OUTSIDE_COMBAT_KEY " =%n", &offset) == 0 && offset > 0)
+        {
+            s_outside_combat.clear();
+            const char *at = line + offset;
+            int used = 0;
+            while (sscanf(at, "%u%n", &spell_line, &used) == 1)
+            {
+                s_outside_combat.insert((uint16_t)spell_line);
+                at += used;
+            }
+            has_outside = true;
+            continue;
+        }
+        unsigned summons = 0;
+        if (sscanf(line, "%u %u %u", &owner, &spell_line, &summons) < 2)
         {
             continue;
         }
@@ -293,11 +393,16 @@ static void load_autocast()
         if (owner == OWNER_MAINCHAR || (owner >= OWNER_HERO_BASE && owner < OWNER_HERO_BASE + PLAYER_HERO_COUNT))
         {
             s_autocast.insert(autocast_key(owner, spell_line));
+            if (summons > 0)
+            {
+                s_summon_counts[autocast_key(owner, spell_line)] =
+                    summons > SUMMON_COUNT_MAX ? SUMMON_COUNT_MAX : (int)summons;
+            }
         }
     }
     fclose(f);
     logAPI->logInfo("[autocast] loaded %u toggled spell(s) from %s", (unsigned)s_autocast.size(), AUTOCAST_FILE);
-    if (!has_color || !has_meditation)
+    if (!has_color || !has_meditation || !has_outside || !has_heal)
     {
         save_autocast();    // adds missing settings to the file, so that they can be found
     }
@@ -316,12 +421,66 @@ static void save_autocast()
     fprintf(f, "%s = #%06x\n", OUTLINE_COLOR_KEY, (unsigned)(s_outline_color & 0xffffff));
     fprintf(f, "# Autocast Meditation only while mana is below this percentage of the maximum (0 - 100); read when the game starts\n");
     fprintf(f, "%s = %u\n", MEDITATION_KEY, s_meditation_percent);
-    fprintf(f, "# Toggled spells: <owner> <spell line>; owner 65535 = main character, 65280 + n = hero slot n\n");
+    fprintf(f, "# Spell lines also cast outside fights, while the caster stands idle (2 Healing, 45 Greater\n");
+    fprintf(f, "# Healing, 125 Charisma, 130 Enlightenment, 132 Meditation, ...); healing goes to the most\n");
+    fprintf(f, "# wounded of the avatar and heroes in range, anything else to the caster once it has run out\n");
+    fprintf(f, "%s =", OUTSIDE_COMBAT_KEY);
+    for (std::set<uint16_t>::iterator it = s_outside_combat.begin(); it != s_outside_combat.end(); ++it)
+    {
+        fprintf(f, " %u", *it);
+    }
+    fprintf(f, "\n");
+    fprintf(f, "# Healing outside fights only for health below this percentage of the maximum (0 - 100)\n");
+    fprintf(f, "%s = %u\n", HEAL_KEY, s_heal_percent);
+    fprintf(f, "# Toggled spells: <owner> <spell line> [summons to keep]; owner 65535 = main character,\n");
+    fprintf(f, "# 65280 + n = hero slot n\n");
     for (std::set<uint32_t>::iterator it = s_autocast.begin(); it != s_autocast.end(); ++it)
     {
-        fprintf(f, "%u %u\n", *it >> 16, *it & 0xffff);
+        std::map<uint32_t, int>::iterator count = s_summon_counts.find(*it);
+        if (count != s_summon_counts.end())
+        {
+            fprintf(f, "%u %u %d\n", *it >> 16, *it & 0xffff, count->second);
+        }
+        else
+        {
+            fprintf(f, "%u %u\n", *it >> 16, *it & 0xffff);
+        }
     }
     fclose(f);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Summons                                                                   */
+/* ------------------------------------------------------------------------ */
+
+static bool is_summon(uint16_t spell_line)
+{
+    return sfsf->spellAPI->hasSpellTag(spell_line, SpellTag::SUMMON_SPELL);
+}
+
+// Summons to keep for a toggled summon spell (1 unless set)
+static int summons_wanted(uint16_t owner, uint16_t spell_line)
+{
+    std::map<uint32_t, int>::iterator it = s_summon_counts.find(autocast_key(owner, spell_line));
+    return it != s_summon_counts.end() ? it->second : 1;
+}
+
+// Summons of the line the caster has: each is a spell of the line running
+// with the caster as its source and the summoned figure as its target
+static int count_summons(SF_CGdSpell *spells, SF_CGdFigure *figures, uint16_t caster, uint16_t spell_line)
+{
+    int count = 0;
+    for (int i = 1; i <= spells->max_used && i < 800; i++)
+    {
+        SF_GdSpell *spell = &spells->active_spell_list[i];
+        if (spell->spell_line == spell_line && spell->spell_id != 0 && spell->source.entity_type == 1 &&
+            spell->source.entity_index == caster && spell->target.entity_type == 1 &&
+            spell->target.entity_index != caster && sfsf->figureAPI->isAlive(figures, spell->target.entity_index))
+        {
+            count++;
+        }
+    }
+    return count;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -419,6 +578,10 @@ static void __thiscall ai_rank_actions_hook(void *battle)
         {
             continue;
         }
+        if (is_summon(spell_line))
+        {
+            continue;   // cast by cast_due (in place of the AI's choice), up to the number set
+        }
         if (spell_line == kGdSpellLineMeditation)
         {
             SF_CGdFigure *figures = data->CGdFigure;
@@ -460,8 +623,16 @@ static void __thiscall ai_rank_actions_hook(void *battle)
 // and support spells keep the target the battle AI chose for them. The AI does
 // not know spells that can only be cast on the caster (like Enlightenment) and
 // may pick another unit for them; those are turned back on the caster.
+static bool cast_due(SF_CGdFigureJobs *jobs, uint16_t figure, bool in_fight);
+
 static void __thiscall ai_execute_action_hook(void *battle)
 {
+    CGdAIBattleData *battle_data = &((SF_CGdBattleDevelopment *)battle)->battleData;
+    if ((field<int>(battle, AIBD_IS_MAINCHAR) || field<int>(battle, AIBD_IS_HERO)) &&
+        cast_due(battle_data->CGdFigureJobs, battle_data->current_figure, true))
+    {
+        return;     // a summon is due: ordered in place of the AI's choice
+    }
     uint16_t action = field<uint16_t>(battle, AIBD_CURRENT_ACTION);
     if (battle == s_injected_battle && field<uint16_t>(battle, AIBD_CURRENT_FIGURE) == s_injected_figure &&
         s_injected_lines.count(action))
@@ -516,6 +687,166 @@ static void __thiscall ai_leave_battle_hook(SF_CGdBattleDevelopment *battle)
         }
     }
     s_leave_battle_trampoline(battle);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Outside fights                                                            */
+/* ------------------------------------------------------------------------ */
+
+static bool is_heal(uint16_t spell_line)
+{
+    return spell_line == kGdSpellLineHealing || spell_line == kGdSpellLineGreaterHealing;
+}
+
+// The most wounded of the avatar and heroes within the spell's range, below
+// the share of health set; 0 when none
+static uint16_t heal_target(SF_CGdFigureJobs *jobs, uint16_t caster, uint16_t spell_id)
+{
+    SF_CGdResourceSpell data;
+    memset(&data, 0, sizeof(data));
+    sfsf->spellAPI->getResourceSpellData(jobs->CGdResource, &data, spell_id);
+    uint16_t party[1 + PLAYER_HERO_COUNT];
+    int count = get_party(s_cuimain, party);
+    uint16_t best = 0;
+    unsigned best_percent = s_heal_percent;
+    for (int i = 0; i < count; i++)
+    {
+        uint16_t figure = party[i];
+        if (figure == 0 || !sfsf->figureAPI->isAlive(jobs->CGdFigure, figure))
+        {
+            continue;
+        }
+        unsigned percent = sfsf->figureAPI->getCurrentHealthPercent(jobs->CGdFigure, figure);
+        if (percent >= best_percent)
+        {
+            continue;
+        }
+        SF_Coord from = jobs->CGdFigure->figures[caster].position;
+        SF_Coord to = jobs->CGdFigure->figures[figure].position;
+        if (figure != caster && sfsf->toolboxAPI->getDistance(&from, &to) > data.max_range)
+        {
+            continue;
+        }
+        best = figure;
+        best_percent = percent;
+    }
+    return best;
+}
+
+// Orders the first toggled spell (in slot order) that is due for the avatar or
+// a hero of the local player: summons below the number set, and outside a fight
+// the spells set for outside fights. True when a cast was ordered.
+static bool cast_due(SF_CGdFigureJobs *jobs, uint16_t figure, bool in_fight)
+{
+    HeroSlots hero;
+    if (!jobs || !s_cuimain || s_autocast.empty() || !get_hero_slots(s_cuimain, figure, &hero))
+    {
+        return false;
+    }
+    SF_CGdFigure *figures = jobs->CGdFigure;
+    SF_CGdFigureToolbox *toolbox = jobs->CGdFigureToolBox;
+    if (!sfsf->figureAPI->isAlive(figures, figure) ||
+        sfsf->toolboxAPI->hasSpellOnIt(toolbox, figure, kGdSpellLineConfuse) ||
+        sfsf->toolboxAPI->hasSpellOnIt(toolbox, figure, kGdSpellLineConfuseArea))
+    {
+        return false;   // (a confused hero refuses casts, with a complaint)
+    }
+    uint32_t now = s_current_tick(toolbox->maybe_random);
+    for (int i = 0; i < hero.count; i++)
+    {
+        uint16_t spell_line, spell_id;
+        uint32_t ready_tick;
+        if (!get_slot_spell(s_cuimain, hero, i, &spell_line, &spell_id, &ready_tick) ||
+            !autocast_enabled(hero.owner, spell_line))
+        {
+            continue;
+        }
+        bool summon = is_summon(spell_line);
+        if (!summon && (in_fight || !s_outside_combat.count(spell_line)))
+        {
+            continue;
+        }
+        uint32_t key = ((uint32_t)figure << 16) | spell_line;
+        std::map<uint32_t, uint32_t>::iterator ordered = s_ordered.find(key);
+        if (ordered != s_ordered.end() && now < ordered->second)
+        {
+            continue;
+        }
+        // cooldown and mana (a hero's cast order checks only the mana, and
+        // complains when it is short)
+        SF_SGtFigureAction action;
+        action.type = spell_line;
+        action.subtype = spell_id;
+        action.cooldown_action = ready_tick;
+        action.cooldown_global = 0;
+        if (!s_figure_can_cast(toolbox, figure, &action))
+        {
+            continue;
+        }
+        uint16_t target = figure;
+        int summons = 0;
+        if (summon)
+        {
+            summons = count_summons(jobs->CGdSpell, figures, figure, spell_line);
+            if (summons >= summons_wanted(hero.owner, spell_line))
+            {
+                continue;
+            }
+        }
+        else if (spell_line == kGdSpellLineMeditation)
+        {
+            uint32_t mana = sfsf->figureAPI->getCurrentStat(figures, figure, MANA);
+            uint32_t max_mana = sfsf->figureAPI->getMaxStat(figures, figure, MANA);
+            if (mana * 100 >= max_mana * s_meditation_percent)
+            {
+                continue;
+            }
+        }
+        else if (is_heal(spell_line))
+        {
+            target = heal_target(jobs, figure, spell_id);
+            if (target == 0)
+            {
+                continue;
+            }
+        }
+        else if (sfsf->toolboxAPI->hasSpellOnIt(toolbox, figure, spell_line))
+        {
+            continue;
+        }
+        SF_Coord position = figures->figures[target].position;
+        int ok = s_do_cast(toolbox, figure, spell_id, target, TARGET_FIGURE, position, 0, 0);
+        // a summon only counts once its cast is done
+        SF_CGdResourceSpell data;
+        memset(&data, 0, sizeof(data));
+        sfsf->spellAPI->getResourceSpellData(jobs->CGdResource, &data, spell_id);
+        s_ordered[key] = now + ORDER_GUARD_TICKS + (summon ? data.cast_time * TICKS_PER_SECOND / 1000 : 0);
+        if (summon)
+        {
+            logAPI->logInfo("[autocast] figure %u %s: summons (spell line %u, has %d of %d)%s", figure,
+                            in_fight ? "battle AI" : "idle", spell_line, summons,
+                            summons_wanted(hero.owner, spell_line), ok ? "" : " - refused");
+        }
+        else
+        {
+            logAPI->logInfo("[autocast] figure %u idle: casts spell line %u (spell %u) on figure %u%s", figure,
+                            spell_line, spell_id, target, ok ? "" : " - refused");
+        }
+        return ok != 0;
+    }
+    return false;
+}
+
+static void __thiscall job_nothing_hook(SF_CGdFigureJobs *jobs, uint32_t figure)
+{
+    s_job_nothing(jobs, figure);
+    cast_due(jobs, (uint16_t)figure, false);
+}
+
+static void __thiscall job_warrior_nothing_hook(SF_CGdFigureJobs *jobs, uint32_t figure)
+{
+    s_job_warrior_nothing(jobs, figure);
+    cast_due(jobs, (uint16_t)figure, false);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -591,7 +922,9 @@ static void count_autocast(void *cuimain, const ActionSlot &slot, int *heroes, i
     }
 }
 
-static void toggle_autocast(void *bottom, void *button)
+// Right click on an action button: toggles autocast; with "+" or "-" held
+// (delta 1 or -1), changes the number of summons to keep of a summon spell
+static void toggle_autocast(void *bottom, void *button, int delta)
 {
     void *cuimain = get_cuimain(bottom);
     int index = get_button_index(bottom, button);
@@ -605,6 +938,33 @@ static void toggle_autocast(void *bottom, void *button)
     if (heroes == 0)
     {
         logAPI->logInfo("[autocast] spell line %u on button %d has no hero caster", slot.spell_line, index);
+        return;
+    }
+    if (delta != 0 && is_summon(slot.spell_line))
+    {
+        for (uint16_t *it = slot.figures_begin; it < slot.figures_end; ++it)
+        {
+            HeroSlots hero;
+            if (!get_hero_slots(cuimain, *it, &hero))
+            {
+                continue;
+            }
+            uint32_t key = autocast_key(hero.owner, slot.spell_line);
+            int count = (autocast_enabled(hero.owner, slot.spell_line) ? summons_wanted(hero.owner, slot.spell_line)
+                                                                       : 0) + delta;
+            count = count < 0 ? 0 : count > SUMMON_COUNT_MAX ? SUMMON_COUNT_MAX : count;
+            if (count > 0)
+            {
+                s_autocast.insert(key);
+                s_summon_counts[key] = count;
+            }
+            else
+            {
+                s_autocast.erase(key);
+            }
+            logAPI->logInfo("[autocast] figure %u spell line %u: keep %d summon(s)", *it, slot.spell_line, count);
+        }
+        save_autocast();
         return;
     }
     bool enable = enabled < heroes;
@@ -701,7 +1061,10 @@ static void poll_right_click(void *bottom)
     {
         if (pressed_button >= 0 && button_under_cursor(bottom) == pressed_button)
         {
-            toggle_autocast(bottom, field<void *>(bottom, CUIBOTTOM_ACTION_BUTTONS + pressed_button * 4));
+            bool plus = (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) || (GetAsyncKeyState(VK_ADD) & 0x8000);
+            bool minus = (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) || (GetAsyncKeyState(VK_SUBTRACT) & 0x8000);
+            toggle_autocast(bottom, field<void *>(bottom, CUIBOTTOM_ACTION_BUTTONS + pressed_button * 4),
+                            plus == minus ? 0 : plus ? 1 : -1);
         }
         pressed_button = -1;
     }
@@ -738,9 +1101,8 @@ struct OutlineVertex
     D3DCOLOR color;
 };
 
-static int add_quad(OutlineVertex *v, float x0, float y0, float x1, float y1)
+static int add_quad(OutlineVertex *v, float x0, float y0, float x1, float y1, D3DCOLOR c)
 {
-    const D3DCOLOR c = s_outline_color;
     const OutlineVertex quad[6] = {
         {x0, y0, 0.0f, 1.0f, c}, {x1, y0, 0.0f, 1.0f, c}, {x0, y1, 0.0f, 1.0f, c},
         {x1, y0, 0.0f, 1.0f, c}, {x1, y1, 0.0f, 1.0f, c}, {x0, y1, 0.0f, 1.0f, c},
@@ -756,10 +1118,52 @@ static int add_outline(OutlineVertex *v, float x, float y, float w, float h)
     y -= 0.5f;
     const float t = OUTLINE_THICKNESS;
     int n = 0;
-    n += add_quad(v + n, x, y, x + w, y + t);
-    n += add_quad(v + n, x, y + h - t, x + w, y + h);
-    n += add_quad(v + n, x, y + t, x + t, y + h - t);
-    n += add_quad(v + n, x + w - t, y + t, x + w, y + h - t);
+    const D3DCOLOR c = s_outline_color;
+    n += add_quad(v + n, x, y, x + w, y + t, c);
+    n += add_quad(v + n, x, y + h - t, x + w, y + h, c);
+    n += add_quad(v + n, x, y + t, x + t, y + h - t, c);
+    n += add_quad(v + n, x + w - t, y + t, x + w, y + h - t, c);
+    return n;
+}
+
+// Digits 0 - 9 of 3 x 5 pixels, a row of 3 bits each (top row first)
+static const uint8_t DIGITS[10][5] = {
+    {7, 5, 5, 5, 7}, {2, 6, 2, 2, 7}, {7, 1, 7, 4, 7}, {7, 1, 7, 1, 7}, {5, 5, 7, 1, 1},
+    {7, 4, 7, 1, 7}, {7, 4, 7, 5, 7}, {7, 1, 1, 1, 1}, {7, 5, 7, 5, 7}, {7, 5, 7, 1, 7},
+};
+#define COUNT_VERTICES_MAX  (6 * (1 + 2 * 15))
+
+// A number (0 - 99) in the top right corner of a button: light digits on a dark box
+static int add_count(OutlineVertex *v, float x, float y, float w, float h, int number)
+{
+    char text[4];
+    int length = snprintf(text, sizeof(text), "%d", number < 0 ? 0 : number > 99 ? 99 : number);
+    float p = floorf(h / 18.0f);
+    if (p < 2.0f)
+    {
+        p = 2.0f;
+    }
+    float right = floorf(x + w - OUTLINE_THICKNESS - 1.0f);
+    float top = floorf(y + OUTLINE_THICKNESS + 1.0f);
+    float width = length * 4.0f * p + p;
+    int n = add_quad(v, right - width - 0.5f, top - 0.5f, right - 0.5f, top + 7.0f * p - 0.5f,
+                     D3DCOLOR_ARGB(0xff, 0x10, 0x10, 0x10));
+    for (int c = 0; c < length; c++)
+    {
+        const uint8_t *rows = DIGITS[text[c] - '0'];
+        float left = right - width + p + c * 4.0f * p;
+        for (int row = 0; row < 5; row++)
+        {
+            for (int bit = 0; bit < 3; bit++)
+            {
+                if (rows[row] & (4 >> bit))
+                {
+                    float px = left + bit * p - 0.5f, py = top + p + row * p - 0.5f;
+                    n += add_quad(v + n, px, py, px + p, py + p, D3DCOLOR_ARGB(0xff, 0xff, 0xff, 0xff));
+                }
+            }
+        }
+    }
     return n;
 }
 
@@ -854,7 +1258,7 @@ static void __thiscall bottom_render_hook(void *bottom, float param_1, float par
         return;
     }
 
-    OutlineVertex vertices[CUIBOTTOM_ACTION_COUNT * 24];
+    static OutlineVertex vertices[CUIBOTTOM_ACTION_COUNT * (24 + COUNT_VERTICES_MAX)];
     int count = 0;
     for (int i = 0; i < CUIBOTTOM_ACTION_COUNT; i++)
     {
@@ -878,6 +1282,20 @@ static void __thiscall bottom_render_hook(void *bottom, float param_1, float par
         // Screen-space rect of the control (the one at +0x134 is relative to the bar)
         float *rect = (float *)((uint8_t *)button + MNU_SCREEN_RECT);
         count += add_outline(vertices + count, rect[0], rect[1], rect[2], rect[3]);
+        if (is_summon(slot.spell_line))
+        {
+            // the number to keep of the first selected hero with it toggled
+            for (uint16_t *it = slot.figures_begin; it < slot.figures_end; ++it)
+            {
+                HeroSlots hero;
+                if (get_hero_slots(cuimain, *it, &hero) && autocast_enabled(hero.owner, slot.spell_line))
+                {
+                    count += add_count(vertices + count, rect[0], rect[1], rect[2], rect[3],
+                                       summons_wanted(hero.owner, slot.spell_line));
+                    break;
+                }
+            }
+        }
     }
     draw_outlines(vertices, count);
 }
@@ -1004,6 +1422,9 @@ extern "C" __declspec(dllexport) void InitModule(SpellforceSpellFramework *frame
     s_spell_of_item = (spell_of_item_ptr)addr_of(RVA_UIDB_SPELL_OF_ITEM);
     s_spell_line = (spell_line_ptr)addr_of(RVA_RESOURCE_SPELL_LINE);
     s_spell_line_is_target_self = (spell_line_flag_ptr)addr_of(RVA_RESOURCE_TARGET_SELF);
+    s_figure_can_cast = (can_cast_ptr)addr_of(RVA_FIGURE_CAN_CAST_SPELL);
+    s_do_cast = (do_cast_ptr)addr_of(RVA_DO_CAST_SPELL);
+    s_current_tick = (tick_ptr)addr_of(RVA_GET_CURRENT_TICK);
 
     load_autocast();
 
@@ -1028,13 +1449,18 @@ extern "C" __declspec(dllexport) void InitModule(SpellforceSpellFramework *frame
                                (void **)&s_orig_bottom_click, 0x5ccff0);
     bool render = hook_vtable_slot(addr_of(RVA_CUIBOTTOM_VT_RENDER), (void *)&bottom_render_hook,
                                    (void **)&s_orig_bottom_render, 0x5096d0);
-    logAPI->logInfo("[autocast] hooks: battle AI %s, aura shutdown %s, right click %s, outline %s",
-                    ai ? "ok" : "FAILED", auras ? "ok" : "FAILED", ui ? "ok" : "FAILED", render ? "ok" : "FAILED");
+    bool idle = hook_call(RVA_JOB_NOTHING_CALL, (void *)&job_nothing_hook, (void **)&s_job_nothing,
+                          RVA_JOB_NOTHING) &&
+                hook_call(RVA_JOB_WARRIOR_NOTHING_CALL, (void *)&job_warrior_nothing_hook,
+                          (void **)&s_job_warrior_nothing, RVA_JOB_WARRIOR_NOTHING);
+    logAPI->logInfo("[autocast] hooks: battle AI %s, aura shutdown %s, right click %s, outline %s, outside fights %s",
+                    ai ? "ok" : "FAILED", auras ? "ok" : "FAILED", ui ? "ok" : "FAILED", render ? "ok" : "FAILED",
+                    idle ? "ok" : "FAILED");
 }
 
 extern "C" __declspec(dllexport) SFMod *RegisterMod(SpellforceSpellFramework *framework)
 {
-    return framework->createModInfo("Hero Autocast", "1.3.1", "Angry Catster",
+    return framework->createModInfo("Hero Autocast", "1.4.0", "Angry Catster",
                                     "Right-click a spell on the action bar to let the avatar or a hero cast it automatically.");
 }
 

@@ -1,5 +1,5 @@
 CC = g++
-DLL_CFLAGS = -O1 -g -std=c++11 ${WARNS} -Iinclude -DADD_EXPORTS -fpermissive -m32
+DLL_CFLAGS = -O1 -g -std=c++11 ${WARNS} -Iinclude -DADD_EXPORTS -fpermissive -m32 ${EXTRA}
 DLL_LDFLAGS = -m32 -shared -static-libgcc -static-libstdc++ -s -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive -Wl,--subsystem,windows,--out-implib,lib/hero_autocast.a
 MOD_OBJ = obj/hero_autocast.o
 
